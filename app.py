@@ -26,6 +26,7 @@ STYLE = """
 [data-testid="stExpander"], [data-testid="stTable"] {background: #fffdf9; color: #29352d;}
 [data-testid="stExpander"] summary,
 [data-testid="stTable"] th, [data-testid="stTable"] td {color: #29352d;}
+[data-testid="stFileUploader"] section {background: #fffdf9; color: #29352d;}
 .block-container {max-width: 880px; padding-top: 2.2rem;}
 .brew-hero {padding: 26px 30px; border-radius: 24px; margin-bottom: 22px;
     background: linear-gradient(120deg, #354c3e, #526e55); color: #fffaf1;}
@@ -69,6 +70,8 @@ def _render_message(message: dict, show_details: bool) -> None:
     with st.chat_message(role, avatar="☕" if role == "assistant" else "👤"):
         # แสดงเป็นข้อความ ไม่อนุญาต HTML จากลูกค้าหรือโมเดล
         st.write(message["content"])
+        if message.get("image_summary"):
+            st.caption(message["image_summary"])
         result = message.get("result")
         if result:
             st.caption(f"เวลาตอบฝั่งระบบ {result['total_seconds']:.3f} วินาที")
@@ -80,6 +83,9 @@ def _render_message(message: dict, show_details: bool) -> None:
                         "retrieval": "ค้นหา RAG",
                         "llm_client": "Claude และตรวจรูปแบบ",
                         "output_guard": "ตรวจคำตอบขั้นสุดท้าย",
+                        "image_prepare": "ตรวจไฟล์รูป",
+                        "image_analysis": "Claude อ่านรูป",
+                        "receipt_check": "โปรแกรมตรวจยอดและราคา",
                     }
                     st.table([
                         {"ขั้นตอน": labels.get(name, name), "วินาที": round(seconds, 4)}
@@ -93,6 +99,13 @@ def _render_message(message: dict, show_details: bool) -> None:
                     if plan:
                         st.write("เงื่อนไขคาเฟอีน:", plan.get("caffeine_status") or "ไม่ได้ระบุ")
                         st.write("อุณหภูมิ:", plan.get("temperature") or "ไม่ได้ระบุ")
+                    image_analysis = result.get("image_analysis")
+                    if image_analysis:
+                        st.write("ประเภทภาพ:", image_analysis["kind"])
+                        st.write("ส่วนที่ไม่แน่ใจ:", image_analysis["uncertainties"] or "ไม่ได้ระบุ")
+                        if image_analysis["kind"] == "receipt":
+                            st.json(image_analysis["arithmetic_check"])
+                            st.table(image_analysis["menu_price_comparisons"])
 
 
 def main() -> None:
@@ -104,6 +117,10 @@ def main() -> None:
     from config import MAX_INPUT_CHARS, MENU_FILE, STORE_INFO_FILE, STORE_POLICIES_FILE
     from llm_client import check_configuration
     from conversation_context import ConversationState
+    from image_handler import prepare_image, ImageValidationError
+
+    if "upload_epoch" not in st.session_state:
+        st.session_state.upload_epoch = 0
 
     st.markdown(
         '<div class="brew-hero"><div class="brew-label">YOUR CAFÉ COMPANION</div>'
@@ -117,6 +134,7 @@ def main() -> None:
         if st.button("เริ่มบทสนทนาใหม่", use_container_width=True):
             st.session_state.messages = []
             st.session_state.conversation_state = ConversationState()
+            st.session_state.upload_epoch += 1
             st.rerun()
         st.caption("เวลาตอบที่แสดงไม่รวมเครือข่ายระหว่างเว็บกับเครื่องผู้ใช้")
 
@@ -140,6 +158,21 @@ def main() -> None:
         st.success("พร้อมให้บริการ")
         if show_details:
             st.caption(f"เวลาโหลดระบบครั้งแรก: {service.startup_seconds:.3f} วินาที")
+        st.subheader("แนบรูปเพื่อสอบถาม")
+        upload = st.file_uploader(
+            "ใบเสร็จ เครื่องดื่ม หรือร้าน", type=["jpg", "jpeg", "png", "webp"],
+            accept_multiple_files=False, max_upload_size=5,
+            key=f"customer_image_{st.session_state.upload_epoch}",
+        )
+        prepared_image = None
+        if upload is not None:
+            try:
+                prepared_image = prepare_image(upload.getvalue())
+                st.image(prepared_image.data, caption="รูปที่จะส่งพร้อมคำถามถัดไป", width="stretch")
+                st.caption("พิมพ์คำถามในช่องแชตแล้วกดส่ง รูปนี้จะถูกส่งไป Claude เพื่อวิเคราะห์")
+            except ImageValidationError as exc:
+                st.error(str(exc))
+        st.caption("ตรวจใบเสร็จได้เฉพาะข้อมูลที่อ่านจากภาพ ไม่ยืนยันความแท้หรือการชำระเงิน")
 
     if "messages" not in st.session_state:
         st.session_state.messages = []  # ประวัติหน้าจอแยกตาม session
@@ -162,18 +195,26 @@ def main() -> None:
 
     for message in st.session_state.messages:
         _render_message(message, show_details)
-    prompt = st.chat_input("สอบถามเมนูหรือข้อมูลร้าน…", max_chars=MAX_INPUT_CHARS)
+    prompt = st.chat_input("สอบถามเมนู ข้อมูลร้าน หรือถามเกี่ยวกับรูปที่แนบ…", max_chars=MAX_INPUT_CHARS)
     question = selected or prompt
     if not question:
         return
+    if upload is not None and prepared_image is None:
+        st.warning("กรุณาเปลี่ยนหรือนำรูปที่อ่านไม่ได้ออกก่อนส่งคำถามค่ะ")
+        return
 
     user_message = {"role": "user", "content": question}
+    if prepared_image is not None:
+        # เก็บเพียงข้อมูลกำกับในประวัติ ไม่สะสมไฟล์รูปทุกข้อความ
+        user_message["image_summary"] = (
+            f"แนบรูป {prepared_image.width} × {prepared_image.height} พิกเซล"
+        )
     st.session_state.messages.append(user_message)
     _render_message(user_message, show_details)
     result = None
     try:
         with st.status("กำลังตรวจสอบคำถาม…", expanded=False) as status:
-            for event in service.stream(question, state=st.session_state.conversation_state):
+            for event in service.stream(question, state=st.session_state.conversation_state, image=prepared_image):
                 if event.result is None:
                     status.update(label=event.status, state="running")
                 else:
@@ -182,7 +223,7 @@ def main() -> None:
                 raise RuntimeError("ไม่มีผลลัพธ์สุดท้าย")
             # เก็บบริบทเฉพาะ session นี้ ไม่เก็บใน service ที่ cache ใช้ร่วมกัน
             st.session_state.conversation_state = result.context_state
-            failed = result.reason in {"llm_error", "retrieval_error", "invalid_source_ids"}
+            failed = result.reason in {"llm_error", "retrieval_error", "invalid_source_ids", "image_analysis_error", "invalid_image"}
             status.update(
                 label="พบปัญหาระหว่างประมวลผล" if failed else "เตรียมคำตอบเรียบร้อยแล้ว",
                 state="error" if failed else "complete", expanded=False,
@@ -194,6 +235,10 @@ def main() -> None:
     st.session_state.messages.append(message)
     st.session_state.messages = st.session_state.messages[-40:]
     _render_message(message, show_details)
+    if prepared_image is not None:
+        # ล้างไฟล์หลังส่ง เพื่อไม่ส่งรูปเดิมติดไปกับทุกคำถาม
+        st.session_state.upload_epoch += 1
+        st.rerun()
 
 
 if __name__ == "__main__":

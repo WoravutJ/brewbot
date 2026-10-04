@@ -3,7 +3,8 @@
 import json
 import sys
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
+from decimal import Decimal
 from time import perf_counter
 from typing import Iterator
 
@@ -26,6 +27,7 @@ class ChatResult:
     context_state: ConversationState = field(default_factory=ConversationState)
     used_context: bool = False
     resolved_plan: QueryPlan | None = None
+    image_analysis: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -88,11 +90,14 @@ class ChatService:
 
     def stream(
         self, question: str, *, state: ConversationState | None = None,
+        image=None,
     ) -> Iterator[ChatEvent]:
         """รับและคืน state; ไม่เก็บบริบทผู้ใช้ไว้ใน service ที่ใช้ร่วมกัน."""
         started = perf_counter()
         next_state = state if state is not None else ConversationState()
         used_context, plan = False, None
+        prepared_image, analysis_data = None, None
+        receipt_evidence = []
         timings = {name: 0.0 for name in (
             "input_guard", "query_parser", "retrieval", "llm_client", "output_guard",
         )}
@@ -101,7 +106,7 @@ class ChatService:
             return ChatEvent("เสร็จแล้ว", ChatResult(
                 text, reason, tuple(menu_ids), tuple(source_ids),
                 dict(timings), perf_counter() - started,
-                next_state, used_context, plan,
+                next_state, used_context, plan, analysis_data,
             ))
 
         yield ChatEvent("กำลังตรวจสอบคำถาม…")
@@ -110,6 +115,16 @@ class ChatService:
         if not check.allow:
             yield finish(check.reply, check.reason)
             return
+
+        if image is not None:
+            from image_handler import ImageValidationError, PreparedImage, prepare_image
+            yield ChatEvent("กำลังตรวจสอบรูปภาพ…")
+            try:
+                with _measure(timings, "image_prepare"):
+                    prepared_image = prepare_image(image.data if isinstance(image, PreparedImage) else image)
+            except (ImageValidationError, TypeError):
+                yield finish("รูปไม่ถูกต้อง กรุณาใช้ JPG, PNG หรือ WEBP ขนาดไม่เกิน 5 MB ค่ะ", "invalid_image")
+                return
 
         yield ChatEvent("กำลังวิเคราะห์ความต้องการ…")
         with _measure(timings, "query_parser"):
@@ -125,21 +140,76 @@ class ChatService:
         if plan.needs_clarification:
             yield finish(plan.clarification_question, "clarification_required")
             return
-        if plan.intent == "greeting":
+        if plan.intent == "greeting" and prepared_image is None:
             yield finish("สวัสดีค่ะ ต้องการสอบถามเมนูหรือข้อมูลร้านเรื่องใดคะ?", "greeting")
             return
         if plan.milk_requirement not in {None, "มีนม"}:
-            # ยังไม่มีสูตรและข้อมูลสารก่อภูมิแพ้ครบ จึงส่งให้พนักงานตรวจ
             yield finish(
                 "กรุณาตรวจสอบส่วนผสมกับพนักงานก่อนเลือกเมนูที่ต้องเลี่ยงนมหรือส่วนประกอบค่ะ",
                 "milk_avoidance_unverified",
             )
             return
 
+        if prepared_image is not None:
+            yield ChatEvent("กำลังอ่านรูปภาพและข้อความในภาพ…")
+            try:
+                with _measure(timings, "image_analysis"):
+                    analysis = self.llm.analyze_image(prepared_image, question)
+                # คำสั่งที่อ่านได้จากรูปต้องไม่เปลี่ยนกฎของ chatbot
+                extracted_texts = [analysis.description, analysis.search_query, analysis.visible_text,
+                                   *analysis.uncertainties,
+                                   *(item["name"] for item in analysis.receipt_items),
+                                   *(item["label"] for item in analysis.adjustments)]
+                for text in extracted_texts:
+                    chunks = [text[i:i + MAX_INPUT_CHARS] for i in range(0, len(text), MAX_INPUT_CHARS)]
+                    if any(not inspect_input(chunk).allow for chunk in chunks):
+                        yield finish("พบข้อความในรูปที่ไม่เหมาะกับการประมวลผล กรุณาส่งรูปใหม่ค่ะ", "image_content_rejected")
+                        return
+                with _measure(timings, "receipt_check"):
+                    analysis_data = asdict(analysis)
+                    analysis_data["arithmetic_check"] = analysis.receipt_check()
+                    comparisons = []
+                    for item in analysis.receipt_items:
+                        matching = [r for r in self.retriever.records if r["kind"] == "menu"
+                                    and normalize_query(r["metadata"]["name"]) == normalize_query(item["name"])]
+                        comparison = {"receipt_name": item["name"], "status": "menu_name_not_matched"}
+                        if len(matching) == 1:
+                            record = matching[0]
+                            price = str(record["metadata"]["price"])
+                            comparison.update(menu_id=record["id"], menu_price=price,
+                                              receipt_unit_price=item["unit_price"])
+                            comparison["status"] = "unit_price_unreadable" if item["unit_price"] is None else (
+                                "price_matches" if Decimal(item["unit_price"]) == Decimal(price) else "price_mismatch"
+                            )
+                            receipt_evidence.append(SearchResult(record["id"], "menu", record["source"],
+                                                                  record["text"], 1.0, dict(record["metadata"])))
+                        comparisons.append(comparison)
+                    analysis_data["menu_price_comparisons"] = comparisons
+                # รูปช่วยสร้างคำค้น แต่ไม่เพิ่มเงื่อนไขคาเฟอีนหรือนมจากการเดา
+                scope = plan.scope
+                if plan.intent in {"unknown", "greeting"}:
+                    scope = "documents" if analysis.kind == "store" else "menu" if analysis.kind in {"drink", "receipt"} else "all"
+                plan = replace(plan, scope=scope, normalized_query=(
+                    plan.normalized_query + " " + analysis.search_query
+                ).strip())
+            except LLMClientError as exc:
+                yield finish(str(exc), "image_analysis_error")
+                return
+            except Exception:
+                yield finish("อ่านรูปไม่สำเร็จ กรุณาลองใช้รูปที่ชัดขึ้นค่ะ", "image_analysis_error")
+                return
         yield ChatEvent("กำลังค้นหาเมนูและข้อมูลร้าน…")
         try:
             with _measure(timings, "retrieval"):
                 evidence = self._retrieve(plan)
+                if analysis_data is not None:
+                    # หลักฐานภาพแยกจากหลักฐานร้าน และระบุข้อจำกัดการอ่านรูป
+                    evidence = list({item.id: item for item in [*evidence, *receipt_evidence]}.values())
+                    evidence.append(SearchResult(
+                        "IMAGE-001", "image", "customer_upload",
+                        "ข้อมูลที่อ่านจากภาพลูกค้า อาจคลาดเคลื่อน ไม่ยืนยันความแท้หรือการชำระเงิน\n"
+                        + json.dumps(analysis_data, ensure_ascii=False), 1.0, {},
+                    ))
         except Exception:
             yield finish("ค้นหาข้อมูลไม่สำเร็จ กรุณาลองใหม่ค่ะ", "retrieval_error")
             return
@@ -172,7 +242,10 @@ class ChatService:
         yield ChatEvent("กำลังเตรียมคำตอบ…")
         try:
             with _measure(timings, "llm_client"):
-                reply = self.llm.generate(llm_question, evidence)
+                if prepared_image is None:
+                    reply = self.llm.generate(llm_question, evidence)
+                else:
+                    reply = self.llm.generate(llm_question, evidence, image=prepared_image)
         except LLMClientError as exc:
             yield finish(str(exc), "llm_error")
             return
@@ -203,9 +276,9 @@ class ChatService:
             # ตรวจรหัสและเงื่อนไขได้ แต่ยังต้องประเมินความถูกต้องของข้อความจริง
             yield finish(reply.text, "answered", reply.recommended_menu_ids, reply.source_ids)
 
-    def answer(self, question: str, *, state: ConversationState | None = None) -> ChatResult:
+    def answer(self, question: str, *, state: ConversationState | None = None, image=None) -> ChatResult:
         """ใช้กับชุดทดสอบที่ไม่ต้องแสดงสถานะระหว่างทาง."""
-        for event in self.stream(question, state=state):
+        for event in self.stream(question, state=state, image=image):
             if event.result is not None:
                 return event.result
         raise RuntimeError("Chat service ไม่ได้ส่งผลลัพธ์สุดท้าย")
