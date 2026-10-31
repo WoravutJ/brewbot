@@ -22,7 +22,7 @@ STORE_POLICIES_FILE = DATA_DIR / "store_policies.md"
 
 # ใช้ embedding model เดียวกับ V4 เพื่อเริ่มเปรียบเทียบผล
 EMBEDDING_MODEL = "intfloat/multilingual-e5-small"
-TOP_K = 7
+TOP_K = 5
 
 # กำหนดชื่อโมเดลเมื่อถึงขั้นเชื่อม Claude
 LLM_MODEL = os.getenv("ANTHROPIC_MODEL", "").strip()
